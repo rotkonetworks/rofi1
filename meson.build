@@ -3,8 +3,12 @@ project('rofi', 'c',
     meson_version: '>=0.59.0',
     license: [ 'MIT' ],
     default_options: [
-        'c_std=c99',
-        'warning_level=3'
+        'c_std=c23',
+        'warning_level=3',
+        'optimization=3',
+        'b_lto=true',
+        'b_ndebug=if-release',
+        'b_pgo=off'
     ],
 )
 
@@ -34,10 +38,77 @@ foreach f : flags
     endif
 endforeach
 
+# Performance optimization flags
+perf_flags = [
+    '-march=native',           # Optimize for local CPU architecture
+    '-mtune=native',           # Tune for local CPU
+    '-ffast-math',             # Aggressive floating point optimizations
+    '-funroll-loops',          # Unroll loops for better performance
+    '-fomit-frame-pointer',    # Remove frame pointer for speed
+    '-fno-semantic-interposition', # Better optimization for shared libs
+    '-flto=thin',              # ThinLTO for faster linking than full LTO
+]
+foreach f : perf_flags
+    if c_compiler.has_argument(f)
+        add_project_arguments(f, language: 'c')
+    endif
+endforeach
+
+# Security hardening flags
+security_flags = [
+    '-fstack-protector-strong',      # Stack canaries for buffer overflow detection
+    '-D_FORTIFY_SOURCE=2',            # Runtime buffer overflow detection (glibc)
+    '-fstack-clash-protection',       # Prevent stack clash attacks
+    '-Wformat',                       # Warn about format string issues
+    '-Wformat-security',              # Warn about insecure format strings
+    '-Werror=format-security',        # Make format warnings into errors
+    '-Werror=implicit-function-declaration',  # Catch undeclared functions
+    '-fno-delete-null-pointer-checks', # Don't optimize away null checks
+    '-fno-strict-overflow',           # Don't assume signed overflow is UB
+    '-fwrapv',                        # Define signed integer overflow behavior
+]
+foreach f : security_flags
+    if c_compiler.has_argument(f)
+        add_project_arguments(f, language: 'c')
+    endif
+endforeach
+
+# Control Flow Integrity (CFI) - x86_64 only
+if host_machine.cpu_family() == 'x86_64'
+    if c_compiler.has_argument('-fcf-protection=full')
+        add_project_arguments('-fcf-protection=full', language: 'c')
+    endif
+endif
+
+# Ensure Position Independent Executable (PIE) for ASLR
+if c_compiler.has_link_argument('-pie')
+    add_project_link_arguments('-pie', language: 'c')
+endif
+
 if get_option('b_lto')
   add_project_arguments('-Werror=odr', language: 'c')
   add_project_arguments('-Werror=lto-type-mismatch', language: 'c')
   add_project_arguments('-Werror=strict-aliasing', language: 'c')
+endif
+
+# Profile-Guided Optimization (PGO) support
+pgo_option = get_option('b_pgo')
+if pgo_option == 'generate'
+  message('Building with PGO instrumentation')
+  if c_compiler.get_id() == 'clang'
+    add_project_arguments('-fprofile-instr-generate', language: 'c')
+    add_project_link_arguments('-fprofile-instr-generate', language: 'c')
+  elif c_compiler.get_id() == 'gcc'
+    add_project_arguments('-fprofile-generate', language: 'c')
+    add_project_link_arguments('-fprofile-generate', language: 'c')
+  endif
+elif pgo_option == 'use'
+  message('Building with PGO optimization')
+  if c_compiler.get_id() == 'clang'
+    add_project_arguments('-fprofile-instr-use=@0@/default.profdata'.format(meson.project_source_root()), language: 'c')
+  elif c_compiler.get_id() == 'gcc'
+    add_project_arguments('-fprofile-use', '-fprofile-correction', language: 'c')
+  endif
 endif
 
 plugindir  = join_paths(get_option('libdir'), meson.project_name())
