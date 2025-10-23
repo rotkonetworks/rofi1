@@ -30,6 +30,27 @@
 /** The log domain of this dialog. */
 #include "glib.h"
 
+/* Compiler optimization hints for hot/cold paths */
+#if defined(__clang__) || defined(__GNUC__)
+  #define DRUN_HOT __attribute__((hot))
+  #define DRUN_COLD __attribute__((cold))
+  #define DRUN_PURE __attribute__((pure))
+  #define DRUN_CONST __attribute__((const))
+  #define DRUN_FLATTEN __attribute__((flatten))
+  #define DRUN_PREFETCH(addr, rw, locality) __builtin_prefetch(addr, rw, locality)
+  #define DRUN_LIKELY(x) __builtin_expect(!!(x), 1)
+  #define DRUN_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+  #define DRUN_HOT
+  #define DRUN_COLD
+  #define DRUN_PURE
+  #define DRUN_CONST
+  #define DRUN_FLATTEN
+  #define DRUN_PREFETCH(addr, rw, locality)
+  #define DRUN_LIKELY(x) (x)
+  #define DRUN_UNLIKELY(x) (x)
+#endif
+
 #ifdef ENABLE_DRUN
 #include <limits.h>
 #include <stdio.h>
@@ -536,6 +557,7 @@ static gboolean rofi_strv_contains(const char *const *categories,
 /**
  * This function absorbs/freeś path, so this is no longer available afterwards.
  */
+DRUN_COLD
 static void read_desktop_file(DRunModePrivateData *pd, const char *root,
                               const char *path, const gchar *basename,
                               const char *action) {
@@ -739,7 +761,7 @@ static void read_desktop_file(DRunModePrivateData *pd, const char *root,
   }
 
   size_t nl = ((pd->cmd_list_length) + 1);
-  if (nl >= pd->cmd_list_length_actual) {
+  if (DRUN_UNLIKELY(nl >= pd->cmd_list_length_actual)) {
     pd->cmd_list_length_actual += 256;
     pd->entry_list = g_realloc(pd->entry_list, pd->cmd_list_length_actual *
                                                    sizeof(*(pd->entry_list)));
@@ -850,6 +872,7 @@ static void read_desktop_file(DRunModePrivateData *pd, const char *root,
 /**
  * Internal spider used to get list of executables.
  */
+DRUN_COLD
 static void walk_dir(DRunModePrivateData *pd, const char *root,
                      const char *dirname, const gboolean recursive) {
   DIR *dir;
@@ -921,24 +944,44 @@ static void delete_entry_history(const DRunModeEntry *entry) {
   g_free(path);
 }
 
+DRUN_HOT
 static void get_apps_history(DRunModePrivateData *pd) {
   TICK_N("Start drun history");
   unsigned int length = 0;
   gchar *path = g_build_filename(cache_dir, DRUN_CACHE_FILE, NULL);
   gchar **retv = history_get_list(path, &length);
+
+  // Optimization: Use hash table for O(1) lookups instead of O(n*m) nested loops
+  GHashTable *entry_lookup = g_hash_table_new(g_str_hash, g_str_equal);
+
+  // Build hash table mapping desktop_id -> entry index
+  for (size_t i = 0; i < pd->cmd_list_length; i++) {
+    // Prefetch next entry for better cache locality
+    if (DRUN_LIKELY(i + 1 < pd->cmd_list_length)) {
+      DRUN_PREFETCH(&pd->entry_list[i + 1], 0, 3);
+    }
+    if (DRUN_LIKELY(pd->entry_list[i].desktop_id != NULL)) {
+      g_hash_table_insert(entry_lookup, pd->entry_list[i].desktop_id,
+                         GSIZE_TO_POINTER(i));
+    }
+  }
+
+  // Apply history sort indices using O(1) hash lookups
   for (unsigned int index = 0; index < length; index++) {
-    for (size_t i = 0; i < pd->cmd_list_length; i++) {
-      if (g_strcmp0(pd->entry_list[i].desktop_id, retv[index]) == 0) {
-        unsigned int sort_index = length - index;
-        if (G_LIKELY(sort_index < INT_MAX)) {
-          pd->entry_list[i].sort_index = sort_index;
-        } else {
-          // This won't sort right anymore, but never gonna hit it anyway.
-          pd->entry_list[i].sort_index = INT_MAX;
-        }
+    gpointer value = g_hash_table_lookup(entry_lookup, retv[index]);
+    if (value != NULL) {
+      size_t i = GPOINTER_TO_SIZE(value);
+      unsigned int sort_index = length - index;
+      if (G_LIKELY(sort_index < INT_MAX)) {
+        pd->entry_list[i].sort_index = sort_index;
+      } else {
+        // This won't sort right anymore, but never gonna hit it anyway.
+        pd->entry_list[i].sort_index = INT_MAX;
       }
     }
   }
+
+  g_hash_table_destroy(entry_lookup);
   g_strfreev(retv);
   g_free(path);
   TICK_N("Stop drun history");
@@ -969,7 +1012,24 @@ static gint drun_int_sort_list(gconstpointer a, gconstpointer b,
  *******************************************/
 
 /** Version of the DRUN cache file format. */
-#define CACHE_VERSION 3
+#define CACHE_VERSION 4
+
+/** Structure to track directory modification times for cache validation */
+typedef struct {
+  char *path;
+  time_t mtime;
+} DRunDirMtime;
+
+/** Get modification time of a directory, returns 0 on error */
+DRUN_PURE
+static time_t get_dir_mtime(const char *path) {
+  struct stat st;
+  if (path && stat(path, &st) == 0) {
+    return st.st_mtime;
+  }
+  return 0;
+}
+
 static void drun_write_str(FILE *fd, const char *str) {
   size_t l = (str == NULL ? 0 : strlen(str));
   fwrite(&l, sizeof(l), 1, fd);
@@ -1034,6 +1094,7 @@ static gboolean drun_read_stringv(FILE *fd, char ***str) {
   return FALSE;
 }
 
+DRUN_COLD
 static void write_cache(DRunModePrivateData *pd, const char *cache_file) {
   if (cache_file == NULL || config.drun_use_desktop_cache == FALSE) {
     return;
@@ -1077,6 +1138,7 @@ static void write_cache(DRunModePrivateData *pd, const char *cache_file) {
 /**
  * Read cache file. returns FALSE when success.
  */
+DRUN_HOT DRUN_FLATTEN
 static gboolean drun_read_cache(DRunModePrivateData *pd,
                                 const char *cache_file) {
   if (cache_file == NULL || config.drun_use_desktop_cache == FALSE) {
@@ -1087,6 +1149,39 @@ static gboolean drun_read_cache(DRunModePrivateData *pd,
     return TRUE;
   }
   TICK_N("DRUN Read CACHE: start");
+
+  // Optimization: Check if cache is stale by comparing mtimes
+  struct stat cache_stat;
+  if (stat(cache_file, &cache_stat) == 0) {
+    time_t cache_mtime = cache_stat.st_mtime;
+
+    // Check user applications directory first (most likely to change)
+    gchar *user_app_dir = g_build_filename(g_get_user_data_dir(), "applications", NULL);
+    time_t user_mtime = get_dir_mtime(user_app_dir);
+    g_free(user_app_dir);
+
+    if (G_UNLIKELY(user_mtime > cache_mtime)) {
+      g_debug("Cache invalidated: user applications directory modified");
+      TICK_N("DRUN Read CACHE: invalidated by user dir mtime");
+      return TRUE;
+    }
+
+    // Check system application directories
+    const char *system_dirs[] = {
+        "/usr/share/applications",
+        "/usr/local/share/applications",
+        NULL};
+
+    for (int i = 0; system_dirs[i] != NULL; i++) {
+      time_t dir_mtime = get_dir_mtime(system_dirs[i]);
+      if (G_UNLIKELY(dir_mtime > cache_mtime)) {
+        g_debug("Cache invalidated: %s modified after cache", system_dirs[i]);
+        TICK_N("DRUN Read CACHE: invalidated by system dir mtime");
+        return TRUE;
+      }
+    }
+  }
+
   FILE *fd = fopen(cache_file, "r");
   if (fd == NULL) {
     TICK_N("DRUN Read CACHE: stop");
@@ -1202,10 +1297,14 @@ static gboolean drun_read_cache(DRunModePrivateData *pd,
   return FALSE;
 }
 
+DRUN_HOT
 static void get_apps(DRunModePrivateData *pd) {
   char *cache_file = g_build_filename(cache_dir, DRUN_DESKTOP_CACHE_FILE, NULL);
   TICK_N("Get Desktop apps (start)");
+
+  // Try to load from cache - drun_read_cache returns TRUE on failure
   if (drun_read_cache(pd, cache_file)) {
+    // Cache load failed, need to build from scratch
     ThemeWidget *wid = rofi_config_find_widget(drun_mode.name, NULL, TRUE);
 
     /** Load desktop entries */
@@ -1265,7 +1364,12 @@ static void get_apps(DRunModePrivateData *pd) {
 
     write_cache(pd, cache_file);
   } else {
-    g_debug("Read drun entries from cache.");
+    // Cache loaded successfully - still need to apply history for sorting
+    g_debug("Loaded %u drun entries from cache", pd->cmd_list_length);
+    get_apps_history(pd);
+    g_qsort_with_data(pd->entry_list, pd->cmd_list_length,
+                      sizeof(DRunModeEntry), drun_int_sort_list, NULL);
+    TICK_N("Applied history and sorted cache entries");
   }
   g_free(cache_file);
 }
@@ -1605,6 +1709,7 @@ static char *drun_get_completion(const Mode *sw, unsigned int index) {
   return g_strdup_printf("%s", dr->name);
 }
 
+DRUN_HOT
 static int drun_token_match(const Mode *data, rofi_int_matcher **tokens,
                             unsigned int index) {
   DRunModePrivateData *rmpd =
